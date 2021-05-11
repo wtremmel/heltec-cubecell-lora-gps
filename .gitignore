@@ -1,0 +1,10 @@
+.pio
+.pioenvs
+.piolibdeps
+.clang_complete
+.gcc-flags.json
+._*
+pio.map
+src/cubecell.h
+*.FCStd1
+.DS_Store
