@@ -5,6 +5,6 @@
 .gcc-flags.json
 ._*
 pio.map
-src/cubecell.h
+src/cubegps01.h
 *.FCStd1
 .DS_Store
