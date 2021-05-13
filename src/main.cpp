@@ -10,8 +10,6 @@
 
 #include "cubegps01.h"
 
-#include <CayenneLPP.h>
-CayenneLPP lpp(51);
 
 
 
@@ -208,16 +206,6 @@ void setup_i2c() {
   Log.verbose(F("i2c bus scanning complete, %d devices"),devices);
 }
 
-int freeMemory() {
-  char top;
-#ifdef __arm__
-  return &top - reinterpret_cast<char*>(sbrk(0));
-#elif defined(CORE_TEENSY) || (ARDUINO > 103 && ARDUINO != 151)
-  return &top - __brkval;
-#else  // __arm__
-  return __brkval ? &top - __brkval : &top - __malloc_heap_start;
-#endif  // __arm__
-}
 
 // Battery voltage
 void read_voltage() {
@@ -262,9 +250,92 @@ void read_voltage() {
   }
 }
 
-void read_gps() {
+void read_GPS() {
+  // reads GPS and stores result if conditions are met
+  Log.verbose(F("readGPS start"));
+  if (!GPS) {
+    Log.verbose(F("Initializing GPS"));
+    GPS.begin(9600);
+  }
+  Log.verbose(F("Reading GPS"));
+  unsigned long start = millis();
+  do {
+    while (GPS.available() > 0) {
+      gps.encode(GPS.read());
+    }
+  } while (millis() - start < 1000 || gps_wait_for_loc);
+  if (gps.charsProcessed() < 10) {
+    Log.notice(F("No GPS data received"));
+    nextGPS = millis() + 1*60*1000; // try again in 1 minute
+  } else {
+    if (gps.location.isValid() && gps.location.isUpdated()) {
+      lastGPS = millis();
+      Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
+        (double)(gps.location.lat()),
+        (double)(gps.location.lng()),
+        (double)(gps.altitude.meters()));
 
+      whereAmI.gpslong = (uint32_t) (gps.location.lng() * 10000);
+      whereAmI.gpslat = (uint32_t) (gps.location.lat() * 10000);
+      whereAmI.gpsalt = (uint32_t) (gps.altitude.meters() * 100);
+      whereAmI.speed = (uint32_t) (gps.speed.kmph() * 100);
+      whereAmI.direction = (uint32_t) (gps.course.deg() * 100);
+
+      Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
+        gps.speed.kmph(),
+        gps.course.deg());
+
+
+      struct tm tm;
+      tm.tm_sec=gps.time.second();
+      tm.tm_min=gps.time.minute();
+      tm.tm_hour=gps.time.hour();
+      tm.tm_mday=gps.date.day();
+      tm.tm_mon=gps.date.month()-1;
+      tm.tm_year=gps.date.year()-1900;
+
+      whereAmI.timestamp = (uint32_t) mktime(&tm);
+      Log.verbose(F("Unix time %l"),whereAmI.timestamp);
+      Log.verbose(F("ctime = %s"),ctime((time_t *) &whereAmI.timestamp));
+
+      whereAmI.voltage = (uint16_t)(getBatteryVoltage() * 100.0);
+
+      // only push if we have changed location
+      float gpsdelta = abs(gps.location.lng()-lastlong) +
+            abs(gps.location.lat()-lastlat);
+      if (gpsdelta > 0.0002 &&
+          int(gps.location.lng()) != 0 &&
+          int(gps.location.lat()) != 0
+          ) {
+        pushrtcbuffer(&whereAmI);
+        lastlat = gps.location.lat();
+        lastlong= gps.location.lng();
+        lastVoltage = whereAmI.voltage;
+        nopushfor = 0;
+      } else {
+        Log.verbose(F("GPS delta too small (%F), not pushing"),gpsdelta);
+      }
+
+      // calculate next data gathering
+      // speed = 0 -> 5 minutes
+      // speed < 3 -> 2 minutes
+      // speed < 30 -> 1 minute
+      // speed < 100 -> 30s
+      // speed > 100 -> 10s
+
+      if (whereAmI.speed == 0)
+        nextGPS = lastGPS+(60*1000);
+      else
+        nextGPS = lastGPS+10*1000;
+    } else {
+      Log.verbose(F("GPS valid: %T GPS update: %T"),
+        gps.location.isValid(),
+        gps.location.isUpdated());
+      nextGPS = millis() + 5*1000;
+    }
+  }
 }
+
 
 // Sensor routines
 void read_sensors() {
@@ -335,7 +406,6 @@ void setup_chipid() {
   uint64_t chipID=getID();
   Log.notice(F("Chip ID = %X%x"),
     (uint32_t)(chipID>>32),(uint32_t)chipID);
-  Log.notice(F("Free memory = %d"),freeMemory());
 }
 
 void setup_display() {
