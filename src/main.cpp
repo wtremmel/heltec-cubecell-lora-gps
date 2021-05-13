@@ -4,6 +4,9 @@
 #include <ArduinoLog.h>
 #include "CubeCell_NeoPixel.h"
 #include "innerWdt.h"
+#include "HT_SSD1306Wire.h"
+#include "GPS_Air530Z.h"
+
 
 #include "cubegps01.h"
 
@@ -28,6 +31,8 @@ uint32_t last_cycle = HIBERNATION_SLEEPTIME;
 
 // Global Objects
 CubeCell_NeoPixel pixels(1, RGB, NEO_GRB + NEO_KHZ800);
+SSD1306Wire  display(0x3c, 500000, SDA, SCL, GEOMETRY_128_64, GPIO10); // addr , freq , SDA, SCL, resolution , rst
+Air530ZClass GPS;
 
 
 bool voltage_found = true;
@@ -89,6 +94,27 @@ bool ledon = false;
 * the datarate, in case the LoRaMAC layer did not receive an acknowledgment
 */
 uint8_t confirmedNbTrials = 4;
+
+
+// GPS related stuff
+typedef struct sendObject {
+  uint32_t timestamp;
+  uint32_t gpslong, gpslat, gpsalt;
+  uint32_t speed, direction;
+  uint16_t voltage;
+  uint8_t listlen;
+} sendObject_t;
+
+typedef struct list {
+  sendObject_t *o;
+  bool queued;
+  struct list *nxt,*prv;
+} list_t;
+
+list_t *firstInList = NULL,
+  *lastInList = NULL,
+  *deletedList;
+
 
 // external power functions
 void vext_power(bool on) {
@@ -182,6 +208,16 @@ void setup_i2c() {
   Log.verbose(F("i2c bus scanning complete, %d devices"),devices);
 }
 
+int freeMemory() {
+  char top;
+#ifdef __arm__
+  return &top - reinterpret_cast<char*>(sbrk(0));
+#elif defined(CORE_TEENSY) || (ARDUINO > 103 && ARDUINO != 151)
+  return &top - __brkval;
+#else  // __arm__
+  return __brkval ? &top - __brkval : &top - __malloc_heap_start;
+#endif  // __arm__
+}
 
 // Battery voltage
 void read_voltage() {
@@ -226,6 +262,10 @@ void read_voltage() {
   }
 }
 
+void read_gps() {
+
+}
+
 // Sensor routines
 void read_sensors() {
   lpp.reset();
@@ -248,6 +288,8 @@ void read_sensors() {
 
     Wire.end();
   }
+
+  read_gps();
 }
 
 void setup_serial() {
@@ -293,6 +335,16 @@ void setup_chipid() {
   uint64_t chipID=getID();
   Log.notice(F("Chip ID = %X%x"),
     (uint32_t)(chipID>>32),(uint32_t)chipID);
+  Log.notice(F("Free memory = %d"),freeMemory());
+}
+
+void setup_display() {
+  display.init();
+  display.setFont(ArialMT_Plain_10);
+}
+
+void setup_gps() {
+  GPS.begin(9600);
 }
 
 void setup() {
@@ -303,6 +355,7 @@ void setup() {
   delay(5000);
   setup_logging();
   Log.verbose(F("setup(): Logging started"));
+  setup_display();
   setup_chipid();
   setup_check_voltage();
 
