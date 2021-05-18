@@ -1,12 +1,12 @@
 #include "LoRaWan_APP.h"
 #include "Arduino.h"
-#include <Wire.h>
+#include "Wire.h"
 #include <ArduinoLog.h>
 #include "CubeCell_NeoPixel.h"
 #include "innerWdt.h"
-#include "HT_SSD1306Wire.h"
-#include "GPS_Air530Z.h"
-
+#include "cubecell_SSD1306Wire.h"
+#include "GPS_Air530.h"
+#include <time.h>
 
 #include "cubegps01.h"
 
@@ -29,8 +29,9 @@ uint32_t last_cycle = HIBERNATION_SLEEPTIME;
 
 // Global Objects
 CubeCell_NeoPixel pixels(1, RGB, NEO_GRB + NEO_KHZ800);
-SSD1306Wire  display(0x3c, 500000, SDA, SCL, GEOMETRY_128_64, GPIO10); // addr , freq , SDA, SCL, resolution , rst
-Air530ZClass GPS;
+SSD1306Wire dis(0x3c, 500000, I2C_NUM_0, GEOMETRY_128_64, GPIO10);
+
+uint32_t nextGPS = 0, nextLORA = 0, loraDelta = 0, lastGPS = 0;
 
 
 bool voltage_found = true;
@@ -112,6 +113,120 @@ typedef struct list {
 list_t *firstInList = NULL,
   *lastInList = NULL,
   *deletedList;
+
+sendObject_t whereAmI;
+float lastlat = 0, lastlong = 0;
+uint16_t lastVoltage = 0;
+uint8_t nopushfor = 0;
+
+bool pushrtcbuffer(sendObject_t *o) {
+  list_t *new_member;
+
+
+  new_member = (list_t *)malloc(sizeof(list_t));
+  if (new_member)
+    new_member->o = (sendObject_t *)malloc(sizeof(sendObject_t));
+
+
+  // check if we have generated an object
+  if (new_member && new_member->o) {
+    memcpy(new_member->o,o,sizeof(sendObject_t));
+    new_member->queued = false;
+
+    // add it to the chain at the end
+    // special case - chain is empty
+    if (lastInList == NULL) {
+      lastInList = new_member;
+      firstInList= new_member;
+      new_member->prv = NULL;
+      new_member->nxt = NULL;
+    } else {
+      new_member->prv = lastInList;
+      new_member->nxt = NULL;
+      lastInList->nxt = new_member;
+      lastInList = new_member;
+    }
+    return true;
+  } else {
+    return false;
+  }
+}
+
+sendObject_t *poprtcbuffer() {
+  // return last object in list and delete list entry
+  if (lastInList == NULL || lastInList->queued == false) {
+    // nothing to do, list is empty
+    return NULL;
+  } else {
+    sendObject_t *o;
+    o = lastInList->o;
+    if (lastInList->prv != NULL) {
+      lastInList->prv->nxt = NULL;
+    }
+    free(lastInList);
+    return o;
+  }
+}
+
+sendObject_t *poprtcbuffer2() {
+  static sendObject_t o;
+  // remove last object of list
+  if (lastInList == NULL || lastInList->queued == false) {
+    // nothing to do, list is empty
+    return NULL;
+  } else {
+    // do we have an object to copy?
+    if (lastInList->o == NULL) {
+      // no - dump the last element and return NULL
+      list_t *dumpit;
+      dumpit = lastInList;
+      lastInList = dumpit->prv;
+      if (lastInList == NULL)
+        firstInList = NULL;
+      else
+        lastInList->nxt = NULL;
+      free(dumpit);
+      return NULL;
+    } else {
+      memcpy(&o,lastInList->o,sizeof(sendObject_t));
+      free(lastInList->o);
+      list_t *dumpit;
+      dumpit = lastInList;
+      lastInList = dumpit->prv;
+      if (lastInList == NULL)
+        firstInList = NULL;
+      else
+        lastInList->nxt = NULL;
+      free(dumpit);
+      return &o;
+    }
+  }
+}
+
+uint32_t rtcbuflen() {
+  list_t *o = firstInList;
+  uint32_t len = 0;
+
+  while (o) {
+    len++;
+    o = o->nxt;
+  }
+  return len;
+}
+
+void dumprtcbuffer() {
+  #if DEBUG
+  int buflen = 0;
+  list_t *o;
+  o = firstInList;
+  while (o && buflen < 10000) {
+    buflen++;
+    o = o->nxt;
+  }
+
+  Log.verbose(F("buflen = %d"),buflen);
+  #endif
+}
 
 
 // external power functions
@@ -210,7 +325,7 @@ void setup_i2c() {
 // Battery voltage
 void read_voltage() {
   uint16_t v = getBatteryVoltage();
-  lpp.addAnalogInput(5,(float)v / 1000.0);
+  // lpp.addAnalogInput(5,(float)v / 1000.0);
   Log.verbose(F("Voltage: %d"),v);
   if (!hibernationMode && v <= SHUTDOWN_VOLTAGE) {
     Log.notice(F("Voltage %d < Shutdown voltage (%d), hibernation mode"),v,SHUTDOWN_VOLTAGE);
@@ -253,46 +368,43 @@ void read_voltage() {
 void read_GPS() {
   // reads GPS and stores result if conditions are met
   Log.verbose(F("readGPS start"));
-  if (!GPS) {
-    Log.verbose(F("Initializing GPS"));
-    GPS.begin(9600);
-  }
+
   Log.verbose(F("Reading GPS"));
   unsigned long start = millis();
   do {
-    while (GPS.available() > 0) {
-      gps.encode(GPS.read());
+    while (Air530.available() > 0) {
+      Air530.encode(Air530.read());
     }
-  } while (millis() - start < 1000 || gps_wait_for_loc);
-  if (gps.charsProcessed() < 10) {
+  } while (millis() - start < 1000);
+  if (Air530.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
     nextGPS = millis() + 1*60*1000; // try again in 1 minute
   } else {
-    if (gps.location.isValid() && gps.location.isUpdated()) {
+    if (Air530.location.isValid() && Air530.location.isUpdated()) {
       lastGPS = millis();
       Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
-        (double)(gps.location.lat()),
-        (double)(gps.location.lng()),
-        (double)(gps.altitude.meters()));
+        (double)(Air530.location.lat()),
+        (double)(Air530.location.lng()),
+        (double)(Air530.altitude.meters()));
 
-      whereAmI.gpslong = (uint32_t) (gps.location.lng() * 10000);
-      whereAmI.gpslat = (uint32_t) (gps.location.lat() * 10000);
-      whereAmI.gpsalt = (uint32_t) (gps.altitude.meters() * 100);
-      whereAmI.speed = (uint32_t) (gps.speed.kmph() * 100);
-      whereAmI.direction = (uint32_t) (gps.course.deg() * 100);
+      whereAmI.gpslong = (uint32_t) (Air530.location.lng() * 10000);
+      whereAmI.gpslat = (uint32_t) (Air530.location.lat() * 10000);
+      whereAmI.gpsalt = (uint32_t) (Air530.altitude.meters() * 100);
+      whereAmI.speed = (uint32_t) (Air530.speed.kmph() * 100);
+      whereAmI.direction = (uint32_t) (Air530.course.deg() * 100);
 
       Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
-        gps.speed.kmph(),
-        gps.course.deg());
+        Air530.speed.kmph(),
+        Air530.course.deg());
 
 
       struct tm tm;
-      tm.tm_sec=gps.time.second();
-      tm.tm_min=gps.time.minute();
-      tm.tm_hour=gps.time.hour();
-      tm.tm_mday=gps.date.day();
-      tm.tm_mon=gps.date.month()-1;
-      tm.tm_year=gps.date.year()-1900;
+      tm.tm_sec=Air530.time.second();
+      tm.tm_min=Air530.time.minute();
+      tm.tm_hour=Air530.time.hour();
+      tm.tm_mday=Air530.date.day();
+      tm.tm_mon=Air530.date.month()-1;
+      tm.tm_year=Air530.date.year()-1900;
 
       whereAmI.timestamp = (uint32_t) mktime(&tm);
       Log.verbose(F("Unix time %l"),whereAmI.timestamp);
@@ -301,15 +413,15 @@ void read_GPS() {
       whereAmI.voltage = (uint16_t)(getBatteryVoltage() * 100.0);
 
       // only push if we have changed location
-      float gpsdelta = abs(gps.location.lng()-lastlong) +
-            abs(gps.location.lat()-lastlat);
+      float gpsdelta = abs(Air530.location.lng()-lastlong) +
+            abs(Air530.location.lat()-lastlat);
       if (gpsdelta > 0.0002 &&
-          int(gps.location.lng()) != 0 &&
-          int(gps.location.lat()) != 0
+          int(Air530.location.lng()) != 0 &&
+          int(Air530.location.lat()) != 0
           ) {
         pushrtcbuffer(&whereAmI);
-        lastlat = gps.location.lat();
-        lastlong= gps.location.lng();
+        lastlat = Air530.location.lat();
+        lastlong= Air530.location.lng();
         lastVoltage = whereAmI.voltage;
         nopushfor = 0;
       } else {
@@ -329,8 +441,8 @@ void read_GPS() {
         nextGPS = lastGPS+10*1000;
     } else {
       Log.verbose(F("GPS valid: %T GPS update: %T"),
-        gps.location.isValid(),
-        gps.location.isUpdated());
+        Air530.location.isValid(),
+        Air530.location.isUpdated());
       nextGPS = millis() + 5*1000;
     }
   }
@@ -339,7 +451,6 @@ void read_GPS() {
 
 // Sensor routines
 void read_sensors() {
-  lpp.reset();
 
   // switch on power
   vext_power(true);
@@ -360,7 +471,7 @@ void read_sensors() {
     Wire.end();
   }
 
-  read_gps();
+  read_GPS();
 }
 
 void setup_serial() {
@@ -409,12 +520,12 @@ void setup_chipid() {
 }
 
 void setup_display() {
-  display.init();
-  display.setFont(ArialMT_Plain_10);
+  dis.init();
+  dis.setFont(ArialMT_Plain_10);
 }
 
 void setup_gps() {
-  GPS.begin(9600);
+  Air530.begin(9600);
 }
 
 void setup() {
@@ -439,11 +550,25 @@ void setup() {
 
 }
 
-static void prepareTxFrame( ) {
+static bool prepareTxFrame( ) {
   read_sensors();
 
-  appDataSize = lpp.getSize();
-  memcpy(appData,lpp.getBuffer(),appDataSize);
+  // fetch top of queue
+  // list is empty
+  if (lastInList == NULL) {
+    return false;
+  }
+
+  appDataSize = sizeof(sendObject_t);
+  sendObject_t *o;
+  o = poprtcbuffer();
+  if (o) {
+    memcpy(appData,o,appDataSize);
+    free(o);
+    return true;
+  } else {
+    return false;
+  }
 }
 
 // -------------- Command Processing -----------------
@@ -630,10 +755,12 @@ void loop() {
 		}
 		case DEVICE_STATE_SEND:
 		{
-			// prepareTxFrame( appPort );
-      prepareTxFrame();
-			LoRaWAN.send();
-			deviceState = DEVICE_STATE_CYCLE;
+      if (prepareTxFrame()) {
+	      LoRaWAN.send();
+	      deviceState = DEVICE_STATE_CYCLE;
+      } else {  // nothing to send
+        deviceState = DEVICE_STATE_SLEEP;
+      }
 			break;
 		}
 		case DEVICE_STATE_CYCLE:
