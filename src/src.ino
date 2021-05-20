@@ -4,8 +4,8 @@
 #include <ArduinoLog.h>
 #include "CubeCell_NeoPixel.h"
 #include "innerWdt.h"
-#include "cubecell_SSD1306Wire.h"
-#include "GPS_Air530.h"
+#include "HT_SSD1306Wire.h"
+#include "GPS_Air530Z.h"
 #include <time.h>
 
 #include "cubegps01.h"
@@ -28,8 +28,9 @@ uint32_t last_cycle = HIBERNATION_SLEEPTIME;
 
 
 // Global Objects
-CubeCell_NeoPixel pixels(1, RGB, NEO_GRB + NEO_KHZ800);
-SSD1306Wire dis(0x3c, 500000, I2C_NUM_0, GEOMETRY_128_64, GPIO10);
+CubeCell_NeoPixel rgbled(1, RGB, NEO_GRB + NEO_KHZ800);
+SSD1306Wire dis(0x3c, 500000, SDA, SCL, GEOMETRY_128_64, GPIO10); // addr , freq , SDA, SCL, resolution , rst
+Air530ZClass GPS;
 
 uint32_t nextGPS = 0, nextLORA = 0, loraDelta = 0, lastGPS = 0;
 
@@ -244,16 +245,16 @@ void set_led(uint8_t r, uint8_t g, uint8_t b) {
 
   Log.verbose(F("set_led(%d,%d,%d)"),r,g,b);
   if (!pixels_initalized){
-    pixels.begin();
+    rgbled.begin();
     pixels_initalized = true;
   }
 
   if (r == 0 && g == 0 && b == 0) {
-    pixels.clear();
-    pixels.show();
+    rgbled.clear();
+    rgbled.show();
   } else {
-    pixels.setPixelColor(0, pixels.Color(r,g,b));
-    pixels.show();
+    rgbled.setPixelColor(0, rgbled.Color(r,g,b));
+    rgbled.show();
     // delay(10*1000);
   }
 }
@@ -372,39 +373,39 @@ void read_GPS() {
   Log.verbose(F("Reading GPS"));
   unsigned long start = millis();
   do {
-    while (Air530.available() > 0) {
-      Air530.encode(Air530.read());
+    while (GPS.available() > 0) {
+      GPS.encode(GPS.read());
     }
   } while (millis() - start < 1000);
-  if (Air530.charsProcessed() < 10) {
+  if (GPS.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
     nextGPS = millis() + 1*60*1000; // try again in 1 minute
   } else {
-    if (Air530.location.isValid() && Air530.location.isUpdated()) {
+    if (GPS.location.isValid() && GPS.location.isUpdated()) {
       lastGPS = millis();
       Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
-        (double)(Air530.location.lat()),
-        (double)(Air530.location.lng()),
-        (double)(Air530.altitude.meters()));
+        (double)(GPS.location.lat()),
+        (double)(GPS.location.lng()),
+        (double)(GPS.altitude.meters()));
 
-      whereAmI.gpslong = (uint32_t) (Air530.location.lng() * 10000);
-      whereAmI.gpslat = (uint32_t) (Air530.location.lat() * 10000);
-      whereAmI.gpsalt = (uint32_t) (Air530.altitude.meters() * 100);
-      whereAmI.speed = (uint32_t) (Air530.speed.kmph() * 100);
-      whereAmI.direction = (uint32_t) (Air530.course.deg() * 100);
+      whereAmI.gpslong = (uint32_t) (GPS.location.lng() * 10000);
+      whereAmI.gpslat = (uint32_t) (GPS.location.lat() * 10000);
+      whereAmI.gpsalt = (uint32_t) (GPS.altitude.meters() * 100);
+      whereAmI.speed = (uint32_t) (GPS.speed.kmph() * 100);
+      whereAmI.direction = (uint32_t) (GPS.course.deg() * 100);
 
       Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
-        Air530.speed.kmph(),
-        Air530.course.deg());
+        GPS.speed.kmph(),
+        GPS.course.deg());
 
 
       struct tm tm;
-      tm.tm_sec=Air530.time.second();
-      tm.tm_min=Air530.time.minute();
-      tm.tm_hour=Air530.time.hour();
-      tm.tm_mday=Air530.date.day();
-      tm.tm_mon=Air530.date.month()-1;
-      tm.tm_year=Air530.date.year()-1900;
+      tm.tm_sec=GPS.time.second();
+      tm.tm_min=GPS.time.minute();
+      tm.tm_hour=GPS.time.hour();
+      tm.tm_mday=GPS.date.day();
+      tm.tm_mon=GPS.date.month()-1;
+      tm.tm_year=GPS.date.year()-1900;
 
       whereAmI.timestamp = (uint32_t) mktime(&tm);
       Log.verbose(F("Unix time %l"),whereAmI.timestamp);
@@ -413,15 +414,15 @@ void read_GPS() {
       whereAmI.voltage = (uint16_t)(getBatteryVoltage() * 100.0);
 
       // only push if we have changed location
-      float gpsdelta = abs(Air530.location.lng()-lastlong) +
-            abs(Air530.location.lat()-lastlat);
+      float gpsdelta = abs(GPS.location.lng()-lastlong) +
+            abs(GPS.location.lat()-lastlat);
       if (gpsdelta > 0.0002 &&
-          int(Air530.location.lng()) != 0 &&
-          int(Air530.location.lat()) != 0
+          int(GPS.location.lng()) != 0 &&
+          int(GPS.location.lat()) != 0
           ) {
         pushrtcbuffer(&whereAmI);
-        lastlat = Air530.location.lat();
-        lastlong= Air530.location.lng();
+        lastlat = GPS.location.lat();
+        lastlong= GPS.location.lng();
         lastVoltage = whereAmI.voltage;
         nopushfor = 0;
       } else {
@@ -441,8 +442,8 @@ void read_GPS() {
         nextGPS = lastGPS+10*1000;
     } else {
       Log.verbose(F("GPS valid: %T GPS update: %T"),
-        Air530.location.isValid(),
-        Air530.location.isUpdated());
+        GPS.location.isValid(),
+        GPS.location.isUpdated());
       nextGPS = millis() + 5*1000;
     }
   }
@@ -525,7 +526,7 @@ void setup_display() {
 }
 
 void setup_gps() {
-  Air530.begin(9600);
+  GPS.begin(9600);
 }
 
 void setup() {
@@ -757,10 +758,8 @@ void loop() {
 		{
       if (prepareTxFrame()) {
 	      LoRaWAN.send();
-	      deviceState = DEVICE_STATE_CYCLE;
-      } else {  // nothing to send
-        deviceState = DEVICE_STATE_SLEEP;
       }
+      deviceState = DEVICE_STATE_CYCLE;
 			break;
 		}
 		case DEVICE_STATE_CYCLE:
