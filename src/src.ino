@@ -22,8 +22,21 @@
 #define VOLTAGE_MAX 3900  // 3.9V
 #define VOLTAGE_MIN 3000  // 3.0V
 
+//fisrt fix timeout
+#define GPS_INIT_TIMEOUT 10000
+
+//sleep time until next GPS update
+#define GPS_SLEEPTIME 60000
+
+//when gps waked, if in GPS_UPDATE_TIMEOUT, gps not fixed then into low power mode
+#define GPS_UPDATE_TIMEOUT 1000
+
+//once fixed, GPS_CONTINUE_TIME later into low power mode
+#define GPS_CONTINUE_TIME 5000
+
 uint16_t lastV = 0;
 bool hibernationMode = false;
+bool sleepOK = false, ackReceived = true;
 uint32_t last_cycle = HIBERNATION_SLEEPTIME;
 
 
@@ -147,16 +160,19 @@ bool pushrtcbuffer(sendObject_t *o) {
       lastInList->nxt = new_member;
       lastInList = new_member;
     }
+    Log.verbose(F("pushrtcbuffer: true"));
     return true;
   } else {
+    Log.verbose(F("pushrtcbuffer: false"));
     return false;
   }
 }
 
 sendObject_t *poprtcbuffer() {
   // return last object in list and delete list entry
-  if (lastInList == NULL || lastInList->queued == false) {
+  if (lastInList == NULL) {
     // nothing to do, list is empty
+    Log.verbose(F("poprtcbuffer: NULL"));
     return NULL;
   } else {
     sendObject_t *o;
@@ -165,6 +181,7 @@ sendObject_t *poprtcbuffer() {
       lastInList->prv->nxt = NULL;
     }
     free(lastInList);
+    Log.verbose(F("poprtcbuffer: ok"));
     return o;
   }
 }
@@ -172,7 +189,7 @@ sendObject_t *poprtcbuffer() {
 sendObject_t *poprtcbuffer2() {
   static sendObject_t o;
   // remove last object of list
-  if (lastInList == NULL || lastInList->queued == false) {
+  if (lastInList == NULL) {
     // nothing to do, list is empty
     return NULL;
   } else {
@@ -235,7 +252,7 @@ void vext_power(bool on) {
   if (on && !hibernationMode) {
     digitalWrite(Vext,LOW);
   } else {
-    digitalWrite(Vext,HIGH);
+    // digitalWrite(Vext,HIGH);
   }
 }
 
@@ -308,7 +325,7 @@ void setup_i2c() {
   Log.verbose("Scanning i2c bus");
   Wire.begin();
   for(address = 1; address < 127; address++ ) {
-    Log.verbose(F("Trying 0x%x"),address);
+    // Log.verbose(F("Trying 0x%x"),address);
     Wire.beginTransmission(address);
     error = Wire.endTransmission();
 
@@ -366,7 +383,7 @@ void read_voltage() {
   }
 }
 
-void read_GPS() {
+void read_GPS(uint32_t timeout) {
   // reads GPS and stores result if conditions are met
   Log.verbose(F("readGPS start"));
 
@@ -376,12 +393,13 @@ void read_GPS() {
     while (GPS.available() > 0) {
       GPS.encode(GPS.read());
     }
-  } while (millis() - start < 1000);
+  } while (millis() - start < timeout);
   if (GPS.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
     nextGPS = millis() + 1*60*1000; // try again in 1 minute
   } else {
-    if (GPS.location.isValid() && GPS.location.isUpdated()) {
+    if (GPS.location.isValid() && GPS.location.isUpdated() &&
+        GPS.location.lat() != 0 && GPS.location.lng() != 0) {
       lastGPS = millis();
       Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
         (double)(GPS.location.lat()),
@@ -416,6 +434,7 @@ void read_GPS() {
       // only push if we have changed location
       float gpsdelta = abs(GPS.location.lng()-lastlong) +
             abs(GPS.location.lat()-lastlat);
+      gpsdelta = 10;
       if (gpsdelta > 0.0002 &&
           int(GPS.location.lng()) != 0 &&
           int(GPS.location.lat()) != 0
@@ -441,12 +460,16 @@ void read_GPS() {
       else
         nextGPS = lastGPS+10*1000;
     } else {
-      Log.verbose(F("GPS valid: %T GPS update: %T"),
+      Log.verbose(F("GPS sats: %d location: %T time: %T date: %T updated: %T"),
+	GPS.satellites.value(),
         GPS.location.isValid(),
+        GPS.time.isValid(),
+        GPS.date.isValid(),
         GPS.location.isUpdated());
       nextGPS = millis() + 5*1000;
     }
   }
+  delay(10);
 }
 
 
@@ -472,7 +495,7 @@ void read_sensors() {
     Wire.end();
   }
 
-  read_GPS();
+  read_GPS(GPS_UPDATE_TIMEOUT);
 }
 
 void setup_serial() {
@@ -486,7 +509,8 @@ void setup_serial() {
 // Logging helper routines
 void printTimestamp(Print* _logOutput) {
   char c[12];
-  sprintf(c, "%10lu ", TimerGetCurrentTime());
+  // sprintf(c, "%10u ", TimerGetCurrentTime());
+  sprintf(c, "%l ", millis());
   _logOutput->print(c);
 }
 
@@ -526,7 +550,10 @@ void setup_display() {
 }
 
 void setup_gps() {
-  GPS.begin(9600);
+  GPS.begin(115200);
+  GPS.setmode(MODE_GPS);
+  GPS.setNMEA(0xff);
+  read_GPS(GPS_INIT_TIMEOUT);
 }
 
 void setup() {
@@ -537,6 +564,7 @@ void setup() {
   delay(5000);
   setup_logging();
   Log.verbose(F("setup(): Logging started"));
+  setup_gps();
   setup_display();
   setup_chipid();
   setup_check_voltage();
@@ -552,8 +580,6 @@ void setup() {
 }
 
 static bool prepareTxFrame( ) {
-  read_sensors();
-
   // fetch top of queue
   // list is empty
   if (lastInList == NULL) {
@@ -735,15 +761,26 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication)
   process_received_lora(mcpsIndication->BufferSize, mcpsIndication->Buffer);
 }
 
+void downLinkAckHandle() {
+  Log.verbose(F("ack received"));
+  ackReceived = true;
+}
 
 
 void loop() {
-  setup_complete = true;
+
+  if (!setup_complete || (millis() > nextGPS)) {
+    Log.verbose("main loop: reading GPS");
+    read_sensors();
+    Log.verbose("main loop: nextGPS = %l",nextGPS);
+    delay(10);
+  }
+
   switch( deviceState )
 	{
 		case DEVICE_STATE_INIT:
 		{
-			LoRaWAN.generateDeveuiByChipID();
+			// LoRaWAN.generateDeveuiByChipID();
 			printDevParam();
 			LoRaWAN.init(loraWanClass,loraWanRegion);
 			deviceState = DEVICE_STATE_JOIN;
@@ -756,7 +793,9 @@ void loop() {
 		}
 		case DEVICE_STATE_SEND:
 		{
-      if (prepareTxFrame()) {
+      Log.verbose(F("DEVICE_STATE_SEND: ackReceived %T"),ackReceived);
+      if (prepareTxFrame() && ackReceived) {
+        ackReceived = false;
 	      LoRaWAN.send();
       }
       deviceState = DEVICE_STATE_CYCLE;
@@ -765,6 +804,7 @@ void loop() {
 		case DEVICE_STATE_CYCLE:
 		{
 			// Schedule next packet transmission
+      Log.verbose(F("DEVICE_STATE_CYCLE: ackReceived %T"),ackReceived);
 			txDutyCycleTime = appTxDutyCycle + randr( 0, APP_TX_DUTYCYCLE_RND );
 			LoRaWAN.cycle(txDutyCycleTime);
 			deviceState = DEVICE_STATE_SLEEP;
@@ -775,6 +815,8 @@ void loop() {
       // switch off power
       if (!drain_battery)
         vext_power(false);
+      // Log.verbose(F("DEVICE_STATE_SLEEP: ackReceived %T"),ackReceived);
+      delay(10);
 			LoRaWAN.sleep();
 			break;
 		}
@@ -785,4 +827,5 @@ void loop() {
 		}
 	}
 
+  setup_complete = true;
 }
