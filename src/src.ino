@@ -10,15 +10,12 @@
 
 #include "cubegps01.h"
 
-
-
-
 // Power management parameters
 #define SHUTDOWN_VOLTAGE 2600 // 2.6V
 #define RESTART_VOLTAGE 3000  // 3.0V
 #define HIBERNATION_SLEEPTIME 60*1000*5  // 5 minutes
-#define CYCLE_MIN  60000  // 1 minute
-#define CYCLE_MAX 240000  // 4 minutes
+#define CYCLE_MIN  40000  // 1 minute
+#define CYCLE_MAX 60000*15  // 15 minutes
 #define VOLTAGE_MAX 3900  // 3.9V
 #define VOLTAGE_MIN 3000  // 3.0V
 
@@ -36,7 +33,7 @@
 
 uint16_t lastV = 0;
 bool hibernationMode = false;
-bool sleepOK = false, ackReceived = true;
+bool sleepOK = false, ackReceived = true, dataPrepared = false;
 uint32_t last_cycle = HIBERNATION_SLEEPTIME;
 
 
@@ -45,7 +42,7 @@ CubeCell_NeoPixel rgbled(1, RGB, NEO_GRB + NEO_KHZ800);
 SSD1306Wire dis(0x3c, 500000, SDA, SCL, GEOMETRY_128_64, GPIO10); // addr , freq , SDA, SCL, resolution , rst
 Air530ZClass GPS;
 
-uint32_t nextGPS = 0, nextLORA = 0, loraDelta = 0, lastGPS = 0;
+uint32_t nextGPS = 0, nextLORA = 0, loraDelta = 0, lastGPS = 0, loraCount=0;
 
 
 bool voltage_found = true;
@@ -85,6 +82,7 @@ uint8_t appPort = 2;
 
 uint8_t ledr = 0, ledg = 0, ledb = 0;
 bool ledon = false;
+uint8_t displayWhat = 1;
 
 /*!
 * Number of trials to transmit the frame, if the LoRaMAC layer did not
@@ -133,6 +131,32 @@ float lastlat = 0, lastlong = 0;
 uint16_t lastVoltage = 0;
 uint8_t nopushfor = 0;
 
+int fracPart(double val, int n) {
+  return (int)((val - (int)(val))*pow(10,n));
+}
+
+char *fracString(double val, int n) {
+  static char s[10];
+  char buf[8];
+  int i;
+  int frac = (int)((val - (int)(val))*pow(10,n));
+  i = sprintf(buf,"%%0%dd",n);
+  buf[i] = 0;
+  i= sprintf(s,buf,frac);
+  buf[i] = 0;
+  return s;
+}
+
+uint8_t queueLength() {
+  uint8_t i = 0;
+  list_t *t = firstInList;
+  while (t != NULL && i < 255) {
+    i++;
+    t = t->nxt;
+  }
+  return i;
+}
+
 bool pushrtcbuffer(sendObject_t *o) {
   list_t *new_member;
 
@@ -176,12 +200,19 @@ sendObject_t *poprtcbuffer() {
     return NULL;
   } else {
     sendObject_t *o;
+    list_t *prev;
+
     o = lastInList->o;
     if (lastInList->prv != NULL) {
       lastInList->prv->nxt = NULL;
+    } else {
+      firstInList = NULL;
     }
+    prev = lastInList->prv;
     free(lastInList);
-    Log.verbose(F("poprtcbuffer: ok"));
+    lastInList = prev;
+    o->listlen = queueLength();
+    Log.verbose(F("poprtcbuffer: ok, len = %d"),o->listlen);
     return o;
   }
 }
@@ -362,7 +393,7 @@ void read_voltage() {
 
     lastV = v;
   }
-  else if (variableDutyCycle) {
+  else if (0 && variableDutyCycle) {
     // duty cycle depending on voltage
     // max duty cycle = 4 minutes = 240000
     // min duty cycle = 1 minute = 60000
@@ -411,6 +442,7 @@ void read_GPS(uint32_t timeout) {
       whereAmI.gpsalt = (uint32_t) (GPS.altitude.meters() * 100);
       whereAmI.speed = (uint32_t) (GPS.speed.kmph() * 100);
       whereAmI.direction = (uint32_t) (GPS.course.deg() * 100);
+      whereAmI.voltage = getBatteryVoltage();
 
       Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
         GPS.speed.kmph(),
@@ -434,8 +466,8 @@ void read_GPS(uint32_t timeout) {
       // only push if we have changed location
       float gpsdelta = abs(GPS.location.lng()-lastlong) +
             abs(GPS.location.lat()-lastlat);
-      gpsdelta = 10;
-      if (gpsdelta > 0.0002 &&
+      Log.verbose(F("delta = %d.%s"),(int)gpsdelta,fracString(gpsdelta,4));
+      if ((gpsdelta > 0.0004 || nopushfor > 10) &&
           int(GPS.location.lng()) != 0 &&
           int(GPS.location.lat()) != 0
           ) {
@@ -445,7 +477,9 @@ void read_GPS(uint32_t timeout) {
         lastVoltage = whereAmI.voltage;
         nopushfor = 0;
       } else {
-        Log.verbose(F("GPS delta too small (%F), not pushing"),gpsdelta);
+        Log.verbose(F("GPS delta too small (%d.%s), not pushing"),
+          (int)gpsdelta,fracString(gpsdelta, 4));
+          nopushfor++;
       }
 
       // calculate next data gathering
@@ -455,13 +489,13 @@ void read_GPS(uint32_t timeout) {
       // speed < 100 -> 30s
       // speed > 100 -> 10s
 
-      if (whereAmI.speed == 0)
+      if (whereAmI.speed <= 10)
         nextGPS = lastGPS+(60*1000);
       else
         nextGPS = lastGPS+10*1000;
     } else {
       Log.verbose(F("GPS sats: %d location: %T time: %T date: %T updated: %T"),
-	GPS.satellites.value(),
+	      GPS.satellites.value(),
         GPS.location.isValid(),
         GPS.time.isValid(),
         GPS.date.isValid(),
@@ -469,7 +503,6 @@ void read_GPS(uint32_t timeout) {
       nextGPS = millis() + 5*1000;
     }
   }
-  delay(10);
 }
 
 
@@ -478,21 +511,9 @@ void read_sensors() {
 
   // switch on power
   vext_power(true);
-  set_led(ledr,ledg,ledb);
-
-  delay(100);
 
   if (voltage_found) {
     read_voltage();
-  }
-
-  // initialize sensors
-
-  if (!hibernationMode) {
-    setup_i2c();
-
-
-    Wire.end();
   }
 
   read_GPS(GPS_UPDATE_TIMEOUT);
@@ -508,9 +529,9 @@ void setup_serial() {
 
 // Logging helper routines
 void printTimestamp(Print* _logOutput) {
-  char c[12];
-  // sprintf(c, "%10u ", TimerGetCurrentTime());
-  sprintf(c, "%l ", millis());
+  static char c[12];
+  // sprintf(c, "%l ", TimerGetCurrentTime());
+  sprintf(c, "%d ", millis());
   _logOutput->print(c);
 }
 
@@ -560,6 +581,8 @@ void setup() {
   // Turn on watchdog
   innerWdtEnable(true);
 
+
+
   setup_serial();
   delay(5000);
   setup_logging();
@@ -574,7 +597,7 @@ void setup() {
   vext_power(true);
   set_led(ledr,ledg,ledb);
 
-  setup_i2c();
+  // setup_i2c();
   setup_lora();
 
 }
@@ -733,6 +756,40 @@ void process_sensor_command(unsigned char len, unsigned char *buffer) {
   }
 }
 
+void process_display_command(unsigned char len, unsigned char *buffer) {
+  if (len == 0) {
+    Log.error(F("Zero length display command"));
+    return;
+  }
+  switch (buffer[0]) {
+    case 0:
+      displayWhat = 0; // off
+      dis.clear();
+      dis.display();
+      dis.displayOff();
+      break;
+    case 1:
+      displayWhat = 1; // default
+      break;
+    case 2: {
+      char *message = (char *)malloc(len+1);
+      memcpy(message,buffer+1,len-1);
+      message[len] = 0;
+      dis.setTextAlignment(TEXT_ALIGN_CENTER);
+      dis.clear();
+      dis.drawStringMaxWidth(0,0,128,message);
+      dis.display();
+      free(message);
+      displayWhat = 2;
+      break;
+    }
+    default:
+      Log.error(F("Unknown display command %d"),buffer[0]);
+      break;
+  }
+
+}
+
 void process_received_lora(unsigned char len, unsigned char *buffer) {
   if (len == 0)
     return;
@@ -744,6 +801,9 @@ void process_received_lora(unsigned char len, unsigned char *buffer) {
       break;
     case 1:
       process_sensor_command(len-1,buffer+1);
+      break;
+    case 3:
+      process_display_command(len-1,buffer+1);
       break;
     default:
       Log.error(F("Unknown command %d"),buffer[0]);
@@ -766,14 +826,70 @@ void downLinkAckHandle() {
   ackReceived = true;
 }
 
+void loop_display() {
+  // standard display
+  char str[30];
+  dis.clear();
+  dis.setFont(ArialMT_Plain_10);
+  int index = sprintf(str,"%02d-%02d-%02d",
+    GPS.date.year(),GPS.date.day(),GPS.date.month());
+  str[index] = 0;
+  dis.setTextAlignment(TEXT_ALIGN_LEFT);
+  dis.drawString(0, 0, str);
+
+  index = sprintf(str,"%02d:%02d:%02d",
+    GPS.time.hour(),GPS.time.minute(),
+    GPS.time.second(),GPS.time.centisecond());
+  str[index] = 0;
+  dis.drawString(60, 0, str);
+
+  if( GPS.location.age() < 1000 ) {
+    dis.drawString(120, 0, "A");
+  } else {
+    dis.drawString(120, 0, "V");
+  }
+
+  index = sprintf(str,"alt: %d.%d",
+    (int)GPS.altitude.meters(),fracPart(GPS.altitude.meters(),2));
+  str[index] = 0;
+  dis.drawString(0, 16, str);
+
+  index = sprintf(str,"hdop: %d.%d",
+    (int)GPS.hdop.hdop(),fracPart(GPS.hdop.hdop(),2));
+  str[index] = 0;
+  dis.drawString(0, 32, str);
+
+  index = sprintf(str,"lat :  %d.%d",
+    (int)GPS.location.lat(),fracPart(GPS.location.lat(),4));
+  str[index] = 0;
+  dis.drawString(60, 16, str);
+
+  index = sprintf(str,"lon:%d.%d",
+    (int)GPS.location.lng(),fracPart(GPS.location.lng(),4));
+  str[index] = 0;
+  dis.drawString(60, 32, str);
+
+  index = sprintf(str,"speed: %d.%d km/h",
+    (int)GPS.speed.kmph(),fracPart(GPS.speed.kmph(),3));
+  str[index] = 0;
+  dis.drawString(0, 48, str);
+
+  index = sprintf(str,"Q: %d",queueLength());
+  str[index] = 0;
+  dis.drawString(80,48,str);
+  dis.display();
+}
+
 
 void loop() {
+  if (displayWhat == 1) {
+    loop_display();
+  }
 
   if (!setup_complete || (millis() > nextGPS)) {
     Log.verbose("main loop: reading GPS");
     read_sensors();
     Log.verbose("main loop: nextGPS = %l",nextGPS);
-    delay(10);
   }
 
   switch( deviceState )
@@ -794,10 +910,26 @@ void loop() {
 		case DEVICE_STATE_SEND:
 		{
       Log.verbose(F("DEVICE_STATE_SEND: ackReceived %T"),ackReceived);
-      if (prepareTxFrame() && ackReceived) {
-        ackReceived = false;
-	      LoRaWAN.send();
+
+      if (ackReceived) {
+        dataPrepared = false;
+        if (prepareTxFrame()) {
+          ackReceived = false;
+          appTxDutyCycle = CYCLE_MIN;
+  	      LoRaWAN.send();
+          loraCount = 0;
+          dataPrepared = true;
+        }
+      } else {
+        appTxDutyCycle =
+          (appTxDutyCycle > CYCLE_MAX) ? CYCLE_MAX : (appTxDutyCycle+10000);
+        loraCount++;
+        if (dataPrepared && loraCount > 10) {
+          LoRaWAN.send();
+          loraCount = 0;
+        }
       }
+
       deviceState = DEVICE_STATE_CYCLE;
 			break;
 		}
@@ -816,8 +948,11 @@ void loop() {
       if (!drain_battery)
         vext_power(false);
       // Log.verbose(F("DEVICE_STATE_SLEEP: ackReceived %T"),ackReceived);
-      delay(10);
-			LoRaWAN.sleep();
+
+      if (millis() + nextGPS > millis() + appTxDutyCycle) {
+        delay(10);
+		    LoRaWAN.sleep();
+      }
 			break;
 		}
 		default:
