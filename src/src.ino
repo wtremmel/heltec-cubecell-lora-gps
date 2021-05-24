@@ -162,9 +162,14 @@ bool pushrtcbuffer(sendObject_t *o) {
 
 
   new_member = (list_t *)malloc(sizeof(list_t));
-  if (new_member)
+  if (new_member) {
     new_member->o = (sendObject_t *)malloc(sizeof(sendObject_t));
-
+    if (new_member->o == NULL) {
+      free(new_member);
+      Log.verbose(F("pushrtcbuffer: false"));
+      return(false);
+    }
+  }
 
   // check if we have generated an object
   if (new_member && new_member->o) {
@@ -193,6 +198,7 @@ bool pushrtcbuffer(sendObject_t *o) {
 }
 
 sendObject_t *poprtcbuffer() {
+  static sendObject_t t;
   // return last object in list and delete list entry
   if (lastInList == NULL) {
     // nothing to do, list is empty
@@ -213,7 +219,9 @@ sendObject_t *poprtcbuffer() {
     lastInList = prev;
     o->listlen = queueLength();
     Log.verbose(F("poprtcbuffer: ok, len = %d"),o->listlen);
-    return o;
+    memcpy(&t,o,sizeof(sendObject_t));
+    free(o);
+    return &t;
   }
 }
 
@@ -476,23 +484,14 @@ void read_GPS(uint32_t timeout) {
         lastlong= GPS.location.lng();
         lastVoltage = whereAmI.voltage;
         nopushfor = 0;
+        nextGPS = millis() + 4*60*1000;
       } else {
         Log.verbose(F("GPS delta too small (%d.%s), not pushing"),
           (int)gpsdelta,fracString(gpsdelta, 4));
           nopushfor++;
+        nextGPS = millis() + 2*60*1000;
       }
 
-      // calculate next data gathering
-      // speed = 0 -> 5 minutes
-      // speed < 3 -> 2 minutes
-      // speed < 30 -> 1 minute
-      // speed < 100 -> 30s
-      // speed > 100 -> 10s
-
-      if (whereAmI.speed <= 10)
-        nextGPS = lastGPS+(60*1000);
-      else
-        nextGPS = lastGPS+10*1000;
     } else {
       Log.verbose(F("GPS sats: %d location: %T time: %T date: %T updated: %T"),
 	      GPS.satellites.value(),
@@ -500,7 +499,7 @@ void read_GPS(uint32_t timeout) {
         GPS.time.isValid(),
         GPS.date.isValid(),
         GPS.location.isUpdated());
-      nextGPS = millis() + 5*1000;
+      nextGPS = millis() + 60 * 5 * 1000; // 5 Minutes
     }
   }
 }
@@ -517,6 +516,36 @@ void read_sensors() {
   }
 
   read_GPS(GPS_UPDATE_TIMEOUT);
+}
+
+void test_memory() {
+  sendObject_t t;
+  int i = 0;
+
+  Log.verbose(F("Testing memory start"));
+  while (pushrtcbuffer(&t)) {
+    i++;
+    Log.verbose(F("Objects pushed: %d"),i);
+  }
+  Log.verbose(F("Memory full"));
+  while (poprtcbuffer() != NULL);
+  Log.verbose(F("Testing ended"));
+  delay(1000);
+}
+
+void test_memleak() {
+  sendObject_t t;
+  int i = 0;
+
+  Log.verbose(F("Testing memleak start"));
+  while (pushrtcbuffer(&t)) {
+    i++;
+    Log.verbose(F("Objects pushed: %d"),i);
+    poprtcbuffer();
+  }
+  Log.verbose(F("Memory full"));
+  Log.verbose(F("Testing ended"));
+  delay(1000);
 }
 
 void setup_serial() {
@@ -614,11 +643,16 @@ static bool prepareTxFrame( ) {
   o = poprtcbuffer();
   if (o) {
     memcpy(appData,o,appDataSize);
-    free(o);
     return true;
   } else {
     return false;
   }
+}
+
+bool prepareEmptyFrame() {
+  appDataSize = 0;
+  appData[0] = 0;
+  return true;
 }
 
 // -------------- Command Processing -----------------
@@ -824,6 +858,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication)
 void downLinkAckHandle() {
   Log.verbose(F("ack received"));
   ackReceived = true;
+  appTxDutyCycle = CYCLE_MIN;
 }
 
 void loop_display() {
@@ -909,7 +944,8 @@ void loop() {
 		}
 		case DEVICE_STATE_SEND:
 		{
-      Log.verbose(F("DEVICE_STATE_SEND: ackReceived %T"),ackReceived);
+      Log.verbose(F("DEVICE_STATE_SEND: ackReceived:%T loraCount:%d"),
+        ackReceived,loraCount);
 
       if (ackReceived) {
         dataPrepared = false;
@@ -924,7 +960,7 @@ void loop() {
         appTxDutyCycle =
           (appTxDutyCycle > CYCLE_MAX) ? CYCLE_MAX : (appTxDutyCycle+10000);
         loraCount++;
-        if (dataPrepared && loraCount > 10) {
+        if (dataPrepared && loraCount > 5) {
           LoRaWAN.send();
           loraCount = 0;
         }
