@@ -14,8 +14,8 @@
 #define SHUTDOWN_VOLTAGE 2600 // 2.6V
 #define RESTART_VOLTAGE 3000  // 3.0V
 #define HIBERNATION_SLEEPTIME 60*1000*5  // 5 minutes
-#define CYCLE_MIN  40000  // 1 minute
-#define CYCLE_MAX 60000*15  // 15 minutes
+#define CYCLE_MIN  35*1000  // 35 second
+#define CYCLE_MAX 120*1000  // 5 minutes
 #define VOLTAGE_MAX 3900  // 3.9V
 #define VOLTAGE_MIN 3000  // 3.0V
 
@@ -23,7 +23,7 @@
 #define GPS_INIT_TIMEOUT 10000
 
 //sleep time until next GPS update
-#define GPS_SLEEPTIME 60000
+#define GPS_SLEEPTIME 60*1000
 
 //when gps waked, if in GPS_UPDATE_TIMEOUT, gps not fixed then into low power mode
 #define GPS_UPDATE_TIMEOUT 1000
@@ -435,7 +435,7 @@ void read_GPS(uint32_t timeout) {
   } while (millis() - start < timeout);
   if (GPS.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
-    nextGPS = millis() + 1*60*1000; // try again in 1 minute
+    nextGPS = millis() + GPS_SLEEPTIME; // try again in 1 minute
   } else {
     if (GPS.location.isValid() && GPS.location.isUpdated() &&
         GPS.location.lat() != 0 && GPS.location.lng() != 0) {
@@ -484,12 +484,12 @@ void read_GPS(uint32_t timeout) {
         lastlong= GPS.location.lng();
         lastVoltage = whereAmI.voltage;
         nopushfor = 0;
-        nextGPS = millis() + 4*60*1000;
+        nextGPS = millis() + GPS_SLEEPTIME;
       } else {
         Log.verbose(F("GPS delta too small (%d.%s), not pushing"),
           (int)gpsdelta,fracString(gpsdelta, 4));
           nopushfor++;
-        nextGPS = millis() + 2*60*1000;
+        nextGPS = millis() + GPS_SLEEPTIME;
       }
 
     } else {
@@ -499,7 +499,7 @@ void read_GPS(uint32_t timeout) {
         GPS.time.isValid(),
         GPS.date.isValid(),
         GPS.location.isUpdated());
-      nextGPS = millis() + 60 * 5 * 1000; // 5 Minutes
+      nextGPS = millis() + GPS_SLEEPTIME; // 2 Minutes
     }
   }
 }
@@ -958,9 +958,9 @@ void loop() {
         }
       } else {
         appTxDutyCycle =
-          (appTxDutyCycle > CYCLE_MAX) ? CYCLE_MAX : (appTxDutyCycle+10000);
+          (appTxDutyCycle > CYCLE_MAX) ? CYCLE_MAX : (appTxDutyCycle+1000);
         loraCount++;
-        if (dataPrepared && loraCount > 5) {
+        if (dataPrepared && loraCount > 2) {
           LoRaWAN.send();
           loraCount = 0;
         }
