@@ -114,6 +114,7 @@ typedef struct sendObject {
   uint32_t speed, direction;
   uint16_t voltage;
   uint8_t listlen;
+  uint32_t hdop;
 } sendObject_t;
 
 typedef struct list {
@@ -451,6 +452,7 @@ void read_GPS(uint32_t timeout) {
       whereAmI.speed = (uint32_t) (GPS.speed.kmph() * 100);
       whereAmI.direction = (uint32_t) (GPS.course.deg() * 100);
       whereAmI.voltage = getBatteryVoltage();
+      whereAmI.hdop = (uint32_t) (GPS.hdop.hdop() * 100);
 
       Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
         GPS.speed.kmph(),
@@ -606,6 +608,10 @@ void setup_gps() {
   read_GPS(GPS_INIT_TIMEOUT);
 }
 
+void setup_pushbutton() {
+  pinMode(USER_KEY,INPUT);
+}
+
 void setup() {
   // Turn on watchdog
   innerWdtEnable(true);
@@ -628,7 +634,7 @@ void setup() {
 
   // setup_i2c();
   setup_lora();
-
+  setup_pushbutton();
 }
 
 static bool prepareTxFrame( ) {
