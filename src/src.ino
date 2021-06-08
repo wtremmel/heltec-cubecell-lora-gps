@@ -14,8 +14,8 @@
 #define SHUTDOWN_VOLTAGE 2600 // 2.6V
 #define RESTART_VOLTAGE 3000  // 3.0V
 #define HIBERNATION_SLEEPTIME 60*1000*5  // 5 minutes
-#define CYCLE_MIN  35*1000  // 35 second
-#define CYCLE_MAX 120*1000  // 5 minutes
+#define CYCLE_MIN  20*1000  // 35 second
+#define CYCLE_MAX 40*1000  // 5 minutes
 #define VOLTAGE_MAX 3900  // 3.9V
 #define VOLTAGE_MIN 3000  // 3.0V
 
@@ -104,7 +104,7 @@ uint8_t displayWhat = 1;
 * Note, that if NbTrials is set to 1 or 2, the MAC will not decrease
 * the datarate, in case the LoRaMAC layer did not receive an acknowledgment
 */
-uint8_t confirmedNbTrials = 4;
+uint8_t confirmedNbTrials = 8;
 
 
 // GPS related stuff
@@ -167,7 +167,8 @@ bool pushrtcbuffer(sendObject_t *o) {
     new_member->o = (sendObject_t *)malloc(sizeof(sendObject_t));
     if (new_member->o == NULL) {
       free(new_member);
-      Log.verbose(F("pushrtcbuffer: false"));
+      Log.verbose(F("pushrtcbuffer: out of memory"));
+      send_confirmed(false);
       return(false);
     }
   }
@@ -296,6 +297,12 @@ void vext_power(bool on) {
   }
 }
 
+bool send_confirmed(bool on) {
+  Log.verbose(F("uplink mode now %T (was %T)"),on,isTxConfirmed);
+  isTxConfirmed = on;
+  return isTxConfirmed;
+}
+
 void set_led(uint8_t r, uint8_t g, uint8_t b) {
   // switch on power
   vext_power(true);
@@ -333,7 +340,7 @@ void set_hibernation(bool on) {
   } else {
     if (hibernationMode) {
       hibernationMode = false;
-      appTxDutyCycle = HIBERNATION_SLEEPTIME;
+      appTxDutyCycle = CYCLE_MIN;
       variableDutyCycle = true;
       vext_power(true);
       Log.notice(F("Hibernation mode now off"));
@@ -401,25 +408,6 @@ void read_voltage() {
       appTxDutyCycle = HIBERNATION_SLEEPTIME;
 
     lastV = v;
-  }
-  else if (0 && variableDutyCycle) {
-    // duty cycle depending on voltage
-    // max duty cycle = 4 minutes = 240000
-    // min duty cycle = 1 minute = 60000
-    // min voltage = 3000
-    // max voltage = 3900
-
-
-    // ((t2-t1)/(v2-v1))*(v-v1)+t1
-    long int cycle = ((CYCLE_MIN - CYCLE_MAX)/(VOLTAGE_MAX-VOLTAGE_MIN)) * (v - VOLTAGE_MIN) + CYCLE_MAX;
-    if (cycle < CYCLE_MIN)
-      appTxDutyCycle = CYCLE_MIN;
-    else if (cycle > CYCLE_MAX)
-      appTxDutyCycle = CYCLE_MAX;
-    else
-      appTxDutyCycle = abs(cycle);
-
-    Log.verbose(F("Duty cycle: %d s"),int(appTxDutyCycle / 1000));
   }
 }
 
@@ -890,17 +878,19 @@ void loop_display() {
     dis.drawString(120, 0, "V");
   }
 
+#if 0
   index = sprintf(str,"alt: %d.%d",
     (int)GPS.altitude.meters(),fracPart(GPS.altitude.meters(),2));
   str[index] = 0;
   dis.drawString(0, 16, str);
+#endif
 
   index = sprintf(str,"hdop: %d.%d",
     (int)GPS.hdop.hdop(),fracPart(GPS.hdop.hdop(),2));
   str[index] = 0;
   dis.drawString(0, 32, str);
 
-  index = sprintf(str,"lat :  %d.%d",
+  index = sprintf(str,"lat:%d.%d",
     (int)GPS.location.lat(),fracPart(GPS.location.lat(),4));
   str[index] = 0;
   dis.drawString(60, 16, str);
@@ -910,14 +900,16 @@ void loop_display() {
   str[index] = 0;
   dis.drawString(60, 32, str);
 
+#if 0
   index = sprintf(str,"speed: %d.%d km/h",
     (int)GPS.speed.kmph(),fracPart(GPS.speed.kmph(),3));
   str[index] = 0;
   dis.drawString(0, 48, str);
+#endif
 
-  index = sprintf(str,"Q: %d",queueLength());
+  index = sprintf(str,"Q:%d",queueLength());
   str[index] = 0;
-  dis.drawString(80,48,str);
+  dis.drawString(0,48,str);
   dis.display();
 }
 
@@ -953,7 +945,7 @@ void loop() {
       Log.verbose(F("DEVICE_STATE_SEND: ackReceived:%T loraCount:%d"),
         ackReceived,loraCount);
 
-      if (ackReceived) {
+      if (ackReceived || !isTxConfirmed) {
         dataPrepared = false;
         if (prepareTxFrame()) {
           ackReceived = false;
@@ -961,12 +953,13 @@ void loop() {
   	      LoRaWAN.send();
           loraCount = 0;
           dataPrepared = true;
+          send_confirmed(true);
         }
       } else {
         appTxDutyCycle =
           (appTxDutyCycle > CYCLE_MAX) ? CYCLE_MAX : (appTxDutyCycle+1000);
         loraCount++;
-        if (dataPrepared && loraCount > 2) {
+        if (dataPrepared && loraCount > confirmedNbTrials) {
           LoRaWAN.send();
           loraCount = 0;
         }
